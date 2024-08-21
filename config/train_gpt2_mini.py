@@ -4,24 +4,35 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name='gpt2-124M'
+wandb_run_name='gpt2-mini'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+batch_size = 8
 block_size = 1024
 gradient_accumulation_steps = 5 * 8
 
 # this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+max_iters = 10000
+lr_decay_iters = 10000
 
 # eval stuff
-eval_interval = 1000
-eval_iters = 200
-log_interval = 10
+eval_interval = 100
+eval_iters = 100
+log_interval = 1
 
 # weight decay
 weight_decay = 1e-1
 
-out_dir = 'out_gpt2'
+out_dir = 'out_gpt2_mini'
+
+# model
+n_layer = 1
+n_head = 12
+n_embd = 768
+
+
+init_from = 'resume'
+# init_from = 'scratch'
+
+dataset = 'openwebtext'
