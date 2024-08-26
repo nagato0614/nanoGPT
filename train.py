@@ -21,7 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
-
+import tiktoken
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -49,13 +49,18 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 1
+n_layer = 12
 n_head = 12
 n_embd = 768
+
+# テキストファイルからデータを取得する場合
+text_file_name = None
+get_batch_mode="txt"
+
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 1e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -65,7 +70,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -111,24 +116,130 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+
+def get_batch_bin(split, data_file_list=None):
+    if data_file_list is None:
+        if split == 'train':
+            data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
+        else:
+            data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        file_list = os.listdir(data_dir)
+        file_name = np.random.choice(file_list)
+        data = np.memmap(os.path.join(data_dir, file_name), dtype=np.uint32, mode='r')
+
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    # データを取得
+    x_list = []
+    y_list = []
+
+    for i in ix:
+        x_data = data[i:i+block_size].astype(np.int64)
+        x_data = torch.from_numpy(x_data).long()
+        x_list.append(x_data)
+
+        y_data = data[i+1:i+1+block_size].astype(np.int64)
+        y_data = torch.from_numpy(y_data).long()
+        y_list.append(y_data)
+
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+    
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=False), y.pin_memory().to(device, non_blocking=False)
+    else:
+        x, y = x.to(device), y.to(device)
+    
+    return x, y
+
+def get_batch_txt(split, text_file_name):
+    enc = tiktoken.get_encoding("cl100k_base")
+    token_block = []
+
+    def safe_seek(fp, start_pos, max_seek_back=100):
+        """ ファイルポインタを安全な位置まで戻して、正しい位置に調整する """
+        fp.seek(start_pos)
+
+        for i in range(max_seek_back):
+            try:
+                # 試しに1バイト読んでみてデコードできるか確認
+                fp.read(1)
+                # 読み込めたら、現在の位置が正しい位置
+                return fp.tell()
+            except UnicodeDecodeError:
+                # デコードエラーが発生したら、少し戻って再試行
+                start_pos -= 1
+                fp.seek(start_pos)
+
+        raise ValueError("適切な開始位置が見つかりませんでした。ファイルが壊れている可能性があります。")
+
+
+    fp = open(text_file_name, 'r', encoding='utf-8')
+
+    # ファイル読み込み開始位置をランダムに設定
+    file_size = os.path.getsize(text_file_name)
+    start_pos = safe_seek(fp, start_pos=np.random.randint(0, file_size))
+    fp.seek(start_pos)
+
+    while True:
+        # 1行ずつ読み込む
+        line = fp.readline()
+
+        # EoF の場合はファイルの先頭に戻る
+        if not line:
+            fp.seek(0)
+
+        # token に変換
+        data_ids = enc.encode_ordinary(line)
+
+        # token_block に追加
+        token_block.extend(data_ids)
+
+        # token_block のサイズを取得
+        max_token_size = batch_size * (block_size + 1)
+        current_token_size = len(token_block)
+        if current_token_size > max_token_size:
+            break
+
+
+    x_list = []
+    y_list = []
+    for i in range(batch_size):
+        x_data = token_block[i * block_size:(i + 1) * block_size]
+        x_data = torch.tensor(x_data, dtype=torch.long)
+        x_list.append(x_data)
+
+        y_data = token_block[i * block_size + 1:(i + 1) * block_size + 1]
+        y_data = torch.tensor(y_data, dtype=torch.long)
+        y_list.append(y_data)
+
+    for i in range(batch_size):
+        print(f'x size: {x_list[i].size()}')
+        print(f'y size: {y_list[i].size()}')
+    
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+
+    if device_type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=False), y.pin_memory().to(device, non_blocking=False)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+    
+
+def get_batch(split, data_file_list=None, mode="bin"):
+    if mode == "bin":
+        return get_batch_bin(split, data_file_list)
+    elif mode == "txt" and text_file_name is not None:
+        return get_batch_txt(split, text_file_name)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -145,14 +256,14 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=100000, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=100258, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 100000 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 100000
+        print("defaulting to vocab_size of GPT-2 to 100258")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 100258
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -193,7 +304,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler(enabled=dtype == 'bfloat16')
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -219,7 +330,7 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, mode=get_batch_mode)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -257,7 +368,7 @@ print(f'Parameters: {params:,}')
 print('---------------------------------')
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train', mode=get_batch_mode)
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -310,7 +421,7 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = get_batch('train', mode=get_batch_mode)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
